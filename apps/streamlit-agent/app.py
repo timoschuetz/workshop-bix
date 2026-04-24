@@ -15,7 +15,32 @@ from agent.driver_analysis import analyze_batch_against_golden_profile
 from agent.multivariate import score_isolation_forest
 
 
-st.set_page_config(page_title="Agentic Workshop Quickstarter", page_icon="🤖")
+st.set_page_config(page_title="Agentic Workshop Quickstarter", page_icon="🤖", layout="wide")
+
+
+def _check_password() -> bool:
+    if st.session_state.get("_authenticated"):
+        return True
+
+    expected = st.secrets.get("auth", {}).get("password", "")
+    if not expected:
+        return True  # No password configured → open access (local dev)
+
+    st.title("Agentic Workshop Quickstarter")
+    with st.form("login_form"):
+        pw = st.text_input("Passwort", type="password")
+        if st.form_submit_button("Anmelden"):
+            if pw == expected:
+                st.session_state["_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Falsches Passwort.")
+    return False
+
+
+if not _check_password():
+    st.stop()
+
 st.title("Agentic Workshop Quickstarter")
 
 repo_root = Path(__file__).resolve().parents[2]
@@ -86,11 +111,27 @@ def _deviation_chart(batch_id: str) -> go.Figure | None:
     max_z = [max((abs(z) for z in e.z_scores.values()), default=0.0) for e in evals]
     marker_colors = [_deviation_color(z) for z in max_z]
 
+    def _hover_text(e) -> str:
+        flagged = sorted(
+            [(v, e.z_scores[v]) for v, outside in e.flags.items() if outside and v in e.z_scores],
+            key=lambda kv: abs(kv[1]), reverse=True,
+        )
+        if not flagged:
+            return "Keine Auffälligkeiten"
+        lines = []
+        for v, z in flagged:
+            direction = "↑ zu hoch" if z > 0 else "↓ zu niedrig"
+            lines.append(f"{v}: {direction}")
+        return "<br>".join(lines)
+
+    hover_texts = [_hover_text(e) for e in evals]
+
     fig = go.Figure()
     segs = phase_segments(pts)
     _add_phase_bands(fig, segs)
 
-    phases_present = sorted({str(s.phase) for s in segs if str(s.phase)})
+    seen_phases: set[str] = set()
+    phases_present = [str(s.phase) for s in segs if str(s.phase) and str(s.phase) not in seen_phases and not seen_phases.add(str(s.phase))]  # type: ignore[func-returns-value]
     for ph in phases_present:
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="markers",
@@ -109,7 +150,8 @@ def _deviation_chart(batch_id: str) -> go.Figure | None:
         line=dict(color="rgba(100,100,100,0.4)", width=1.5),
         marker=dict(color=marker_colors, size=7),
         name="Abweichung",
-        hovertemplate="t_pct=%{x:.1f}<br>max|z|=%{y:.2f}<extra></extra>",
+        text=hover_texts,
+        hovertemplate="<b>Zeitfortschritt: %{x:.1f} %</b><br>%{text}<extra></extra>",
     ))
 
     fig.update_layout(
@@ -120,6 +162,28 @@ def _deviation_chart(batch_id: str) -> go.Figure | None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
     return fig
+
+
+def _render_warning_box(last) -> None:
+    if last.critical or last.early_warning:
+        flagged_in_window = last.flagged_variables_window
+        top_z = sorted(last.z_scores.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:5]
+        flagged_lines = "\n".join(f"- **`{v}`**" for v in flagged_in_window) if flagged_in_window else "- –"
+        top_z_lines = "\n".join(f"- **{v}**: {float(z):+.2f}σ" for v, z in top_z) if top_z else "- –"
+        if last.critical:
+            st.error(
+                f"**CRITICAL** — >60 % Überschreitungen in der aktuellen Phase\n\n"
+                f"**Außerhalb des optimalen Fensters:**\n{flagged_lines}\n\n"
+                f"**Größte Abweichungen (|z|):**\n{top_z_lines}"
+            )
+        else:
+            st.warning(
+                f"**EARLY WARNING** — ≥2 Variablen im Sliding Window außerhalb\n\n"
+                f"**Außerhalb des optimalen Fensters:**\n{flagged_lines}\n\n"
+                f"**Größte Abweichungen (|z|):**\n{top_z_lines}"
+            )
+    else:
+        st.success("OK: noch kein Early-Warning.")
 
 
 def _add_phase_bands(fig: go.Figure, segs) -> None:
@@ -160,17 +224,17 @@ Der Graph unten markiert **alle Messpunkte**, die tatsächlich als Datengrundlag
         total_pts = len(all_points)
         good_pts = sum(1 for p in all_points if p.batch_id in good_batch_ids)
         c1, c2, c3 = st.columns(3)
-        c1.metric("Good batches", str(len(good_batch_ids)))
-        c2.metric("All points", str(total_pts))
-        c3.metric("Points used for Golden Profile", str(good_pts))
+        c1.metric("Gute Batches", str(len(good_batch_ids)))
+        c2.metric("Alle Datenpunkte", str(total_pts))
+        c3.metric("Datenpunkte im Golden Profile", str(good_pts))
 
         # Influence plot: show all points, highlight those from good batches
         variables_all = sorted({v for p in all_points for v in p.values.keys()})
         if variables_all:
             default_idx_pts = variables_all.index("temp_C") if "temp_C" in variables_all else 0
-            var_pts = st.selectbox("Influence plot variable", options=variables_all, index=default_idx_pts, key="influence_var")
+            var_pts = st.selectbox("Variable (Einflussplot)", options=variables_all, index=default_idx_pts, key="influence_var")
 
-            max_points = st.slider("Max points to render (performance)", min_value=2000, max_value=60000, value=15000, step=1000)
+            max_points = st.slider("Max. Datenpunkte (Performance)", min_value=2000, max_value=60000, value=15000, step=1000)
 
             @st.cache_data(show_spinner=False)
             def _influence_data(variable: str, max_pts: int) -> dict:
@@ -194,7 +258,7 @@ Der Graph unten markiert **alle Messpunkte**, die tatsächlich als Datengrundlag
 
             data = _influence_data(var_pts, int(max_points))
             if not data["t_pct"]:
-                st.info("No points for influence plot.")
+                st.info("Keine Datenpunkte für den Einflussplot.")
             else:
                 fig_inf = px.scatter(
                     data,
@@ -229,29 +293,43 @@ Der Graph unten markiert **alle Messpunkte**, die tatsächlich als Datengrundlag
 
 
 with tabs[1]:
-    st.subheader("Live Monitoring")
-    if not all_points:
-        st.info("Timeseries file not loaded.")
+    if st.session_state.get("_monitor_fullscreen"):
+        fig_fs = st.session_state.get("_monitor_fig")
+        last_fs = st.session_state.get("_monitor_last")
+        if st.button("✕ Vollbild beenden"):
+            st.session_state["_monitor_fullscreen"] = False
+            st.rerun()
+        if fig_fs is not None and last_fs is not None:
+            fig_fs = go.Figure(fig_fs)
+            fig_fs.update_layout(height=700)
+            st.plotly_chart(fig_fs, use_container_width=True)
+            _render_warning_box(last_fs)
+        else:
+            st.info("Noch kein Batch geladen. Bitte zuerst im normalen Modus einen Batch auswählen.")
     else:
+        st.subheader("Live Monitoring")
+    if not all_points:
+        st.info("Zeitreihendaten nicht geladen.")
+    elif not st.session_state.get("_monitor_fullscreen"):
         batch_id = st.selectbox("Batch", options=sorted({p.batch_id for p in all_points}) or ["A_B003"], index=0)
         pts = _batch_points(batch_id)
         if not pts:
-            st.info(f"No points for {batch_id}.")
+            st.info(f"Keine Datenpunkte für {batch_id}.")
         else:
-            mode = st.radio("Mode", options=["Slider", "Simulated Streaming"], horizontal=True)
-            use_dtw = st.checkbox("Use DTW alignment (tslearn)", value=False)
+            mode = st.radio("Modus", options=["Schieberegler", "Simuliertes Streaming"], horizontal=True)
+            use_dtw = st.checkbox("DTW-Ausrichtung verwenden (tslearn)", value=True)
             variables_all = sorted({v for p in pts for v in p.values.keys()})
             default_var = "temp_C" if "temp_C" in variables_all else (variables_all[0] if variables_all else "temp_C")
             selected_vars = st.multiselect(
-                "Variables to display",
+                "Anzuzeigende Variablen",
                 options=variables_all,
                 default=[default_var] if default_var in variables_all else [],
             )
             if not selected_vars:
                 selected_vars = [default_var]
 
-            if mode == "Slider":
-                n = st.slider("Simulated ingested points", min_value=1, max_value=len(pts), value=min(30, len(pts)))
+            if mode == "Schieberegler":
+                n = st.slider("Simulierte Datenpunkte", min_value=1, max_value=len(pts), value=min(30, len(pts)))
                 pts_n = pts[:n]
             else:
                 import time
@@ -269,7 +347,7 @@ with tabs[1]:
 
                 st.session_state.stream_interval_s = float(
                     st.slider(
-                        "Streaming speed (seconds per point)",
+                        "Geschwindigkeit (Sekunden pro Datenpunkt)",
                         min_value=0.2,
                         max_value=5.0,
                         value=float(st.session_state.stream_interval_s),
@@ -278,7 +356,7 @@ with tabs[1]:
                 )
 
                 c_start, c_pause, c_stop = st.columns(3)
-                if c_start.button("Start / Resume", disabled=st.session_state.stream_running and not st.session_state.stream_paused):
+                if c_start.button("Start / Fortsetzen", disabled=st.session_state.stream_running and not st.session_state.stream_paused):
                     st.session_state.stream_running = True
                     st.session_state.stream_paused = False
 
@@ -322,30 +400,43 @@ with tabs[1]:
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Phase", last.phase)
-            c2.metric("t_pct", f"{last.t_pct:.2f}")
-            c3.metric("Flagged vars (window)", str(len(last.flagged_variables_window)))
+            c2.metric("Zeitfortschritt (%)", f"{last.t_pct:.2f}")
+            c3.metric("Auffällige Variablen", str(len(last.flagged_variables_window)))
 
             # Plot: selected variables vs t_pct with flagged points highlighted + phase bands
             x = [p.t_pct for p in pts_n]
             flagged = [any(e.flags.values()) for e in evals]
             colors = ["#E45756" if f else "#4C78A8" for f in flagged]
 
-            def _fmt_point_hover(e):
-                flagged_vars = [k for k, v in e.flags.items() if v]
-                flagged_vars = sorted(flagged_vars)
-                top_z = sorted(e.z_scores.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:3]
-                top_z_txt = ", ".join([f"{k}={float(z):+.2f}" for k, z in top_z]) if top_z else "-"
-                flagged_txt = ", ".join(flagged_vars) if flagged_vars else "-"
-                return f"phase={e.phase}<br>t_bucket={e.t_pct_bucket}<br>flagged={flagged_txt}<br>top|z|={top_z_txt}"
+            def _fmt_point_hover(e, var: str, val: float) -> str:
+                flagged_vars = sorted([k for k, v in e.flags.items() if v])
+                top_z = sorted(e.z_scores.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:4]
 
-            hover_extra = [_fmt_point_hover(e) for e in evals]
+                def _sev(z: float) -> str:
+                    a = abs(z)
+                    direction = "↑" if z > 0 else "↓"
+                    label = "stark" if a >= 2.5 else "mittel" if a >= 1.2 else "gering"
+                    return f"{direction} {label}"
+
+                lines = [
+                    f"<b>Phase: {e.phase} &nbsp;|&nbsp; {e.t_pct:.1f} %</b>",
+                    f"{var}: {val:.3f}",
+                ]
+                if flagged_vars:
+                    lines.append("<br>⚠ <b>Außerhalb Normalbereich:</b>")
+                    lines += [f"&nbsp;&nbsp;• {v}" for v in flagged_vars]
+                if top_z:
+                    lines.append("<br><b>Stärkste Abweichungen:</b>")
+                    lines += [f"&nbsp;&nbsp;• {v}: {_sev(float(z))}" for v, z in top_z]
+                return "<br>".join(lines)
 
             fig = go.Figure()
             segs = phase_segments(pts_n)
             _add_phase_bands(fig, segs)
 
-            # Phase legend (dummy traces so vrect colors are explained)
-            phases_present = sorted({str(s.phase) for s in segs if str(s.phase)})
+            # Phase legend in order of appearance (left to right in plot)
+            _seen_ph: set[str] = set()
+            phases_present = [str(s.phase) for s in segs if str(s.phase) and str(s.phase) not in _seen_ph and not _seen_ph.add(str(s.phase))]  # type: ignore[func-returns-value]
             for ph in phases_present:
                 fig.add_trace(
                     go.Scatter(
@@ -353,7 +444,7 @@ with tabs[1]:
                         y=[None],
                         mode="markers",
                         marker=dict(size=10, color=_phase_color(ph)),
-                        name=f"phase: {ph}",
+                        name=f"Phase: {ph}",
                         showlegend=True,
                         hoverinfo="skip",
                     )
@@ -372,6 +463,7 @@ with tabs[1]:
 
             for var in selected_vars:
                 y = [float(p.values.get(var, float("nan"))) for p in pts_n]
+                hover_texts = [_fmt_point_hover(e, var, v) for e, v in zip(evals, y)]
                 fig.add_trace(
                     go.Scatter(
                         x=x,
@@ -380,8 +472,8 @@ with tabs[1]:
                         marker=dict(color=colors, size=7),
                         line=dict(width=2),
                         name=var,
-                        text=hover_extra,
-                        hovertemplate=f"t_pct=%{{x:.2f}}<br>{var}=%{{y:.3f}}<br>%{{text}}<extra></extra>",
+                        text=hover_texts,
+                        hovertemplate="%{text}<extra></extra>",
                     )
                 )
 
@@ -423,7 +515,7 @@ with tabs[1]:
                         line=dict(width=0),
                         fill="tonexty",
                         fillcolor="rgba(76,120,168,0.10)",
-                        name=f"Golden band ({var})",
+                        name=f"Optimalband ({var})",
                         hoverinfo="skip",
                     )
                 )
@@ -433,7 +525,7 @@ with tabs[1]:
                         y=opt_mean,
                         mode="lines",
                         line=dict(width=2, dash="dot"),
-                        name=f"Golden median ({var})",
+                        name=f"Optimaler Median ({var})",
                         hoverinfo="skip",
                     )
                 )
@@ -444,45 +536,31 @@ with tabs[1]:
                 xaxis_title="Zeitfortschritt (%)",
                 yaxis_title="Messwert",
             )
+            st.session_state["_monitor_fig"] = fig
+            st.session_state["_monitor_last"] = last
+
             st.plotly_chart(fig, use_container_width=True)
 
-            if last.critical or last.early_warning:
-                flagged_in_window = last.flagged_variables_window
-                top_z = sorted(last.z_scores.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:5]
-                flagged_lines = "\n".join(f"- **`{v}`**" for v in flagged_in_window) if flagged_in_window else "- –"
-                top_z_lines = "\n".join(
-                    f"- **{v}**: {float(z):+.2f}σ" for v, z in top_z
-                ) if top_z else "- –"
-                if last.critical:
-                    st.error(
-                        f"**CRITICAL** — >60 % Überschreitungen in der aktuellen Phase\n\n"
-                        f"**Außerhalb des optimalen Fensters:**\n{flagged_lines}\n\n"
-                        f"**Größte Abweichungen (|z|):**\n{top_z_lines}"
-                    )
-                else:
-                    st.warning(
-                        f"**EARLY WARNING** — ≥2 Variablen im Sliding Window außerhalb\n\n"
-                        f"**Außerhalb des optimalen Fensters:**\n{flagged_lines}\n\n"
-                        f"**Größte Abweichungen (|z|):**\n{top_z_lines}"
-                    )
-            else:
-                st.success("OK: noch kein Early-Warning.")
+            if st.button("⛶ Vollbild"):
+                st.session_state["_monitor_fullscreen"] = True
+                st.rerun()
 
-            st.markdown("**Explainability (which metric affects the batch, and by how much)**")
+            _render_warning_box(last)
+
+            st.markdown("**Erklärbarkeit (welcher Messwert den Batch wie stark beeinflusst)**")
             if not evals:
-                st.info("No evaluations yet.")
+                st.info("Noch keine Auswertung.")
             else:
                 last_eval = evals[-1]
                 if not last_eval.z_scores:
-                    st.info("No z-scores available yet for this point (missing golden profile rows / std==0).")
+                    st.info("Noch keine Abweichungswerte für diesen Punkt verfügbar.")
                 else:
-                    # Point-level contribution: absolute z-score per variable
                     contrib = [
                         {"variable": v, "z": float(z), "abs_z": abs(float(z)), "flagged": bool(last_eval.flags.get(v, False))}
                         for v, z in last_eval.z_scores.items()
                     ]
                     contrib.sort(key=lambda r: r["abs_z"], reverse=True)
-                    top_k = st.slider("Top variables to show", min_value=3, max_value=min(20, len(contrib)), value=min(8, len(contrib)))
+                    top_k = st.slider("Anzahl anzuzeigender Variablen", min_value=3, max_value=min(20, len(contrib)), value=min(8, len(contrib)))
                     contrib_top = contrib[:top_k]
 
                     fig_bar = px.bar(
@@ -493,31 +571,15 @@ with tabs[1]:
                         color="flagged",
                         color_discrete_map={True: "#E45756", False: "#4C78A8"},
                         hover_data={"z": ":.2f", "abs_z": ":.2f", "flagged": True},
-                        title="Current point impact (|z| vs Golden Profile)",
+                        title="Einfluss am aktuellen Messpunkt",
                     )
-                    fig_bar.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20), xaxis_title="|z|", yaxis_title="")
+                    fig_bar.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20), xaxis_title="Abweichung", yaxis_title="")
                     st.plotly_chart(fig_bar, use_container_width=True)
 
 
-            recent = evals[-10:]
-            st.dataframe(
-                [
-                    {
-                        "idx": e.idx,
-                        "phase": e.phase,
-                        "t_pct": round(e.t_pct, 3),
-                        "t_bucket": e.t_pct_bucket,
-                        "flagged_vars": sorted([k for k, v in e.flags.items() if v]),
-                        "early_warning": e.early_warning,
-                        "critical": e.critical,
-                    }
-                    for e in recent
-                ],
-                use_container_width=True,
-            )
 
             # Schedule next tick *after* rendering, so the live view updates.
-            if mode == "Simulated Streaming" and st.session_state.get("stream_running") and st.session_state.get("stream_n", 0) < len(pts):
+            if mode == "Simuliertes Streaming" and st.session_state.get("stream_running") and st.session_state.get("stream_n", 0) < len(pts):
                 import time
 
                 time.sleep(float(st.session_state.get("stream_interval_s", 2.0)))
@@ -535,12 +597,12 @@ with tabs[2]:
         st.plotly_chart(dev_fig, use_container_width=True)
 
     prompt = f"Produktionsbericht für Batch {batch_id}"
-    if st.button("Generate report (Agent)"):
-        with st.spinner("Running agent..."):
+    if st.button("Bericht erstellen"):
+        with st.spinner("Agent läuft..."):
             try:
                 result = run_agent(prompt)
             except Exception as exc:  # noqa: BLE001
-                st.error(f"Agent failed: {exc}")
+                st.error(f"Agent fehlgeschlagen: {exc}")
                 result = {}
 
         analysis = result.get("batch_analysis", {}) if isinstance(result, dict) else {}
@@ -559,11 +621,11 @@ with tabs[2]:
                 html = html.replace(str(v), f"<strong>{v}</strong>")
             st.markdown(html, unsafe_allow_html=True)
         else:
-            st.info("No report returned.")
+            st.info("Kein Bericht erhalten.")
 
-    with st.expander("Planner output / full response"):
-        if st.button("Run agent (show plan/response)"):
-            with st.spinner("Running agent..."):
+    with st.expander("Planerausgabe / vollständige Antwort"):
+        if st.button("Agent ausführen (Plan/Antwort anzeigen)"):
+            with st.spinner("Agent läuft..."):
                 result = run_agent(prompt)
             st.write(result.get("plan", ""))
             st.write(result.get("response", ""))
@@ -573,18 +635,18 @@ if "history" not in st.session_state:
 
 with st.form("prompt_form"):
     user_prompt = st.text_area(
-        "Ask the assistant",
-        placeholder="Try: Calculate (12 * 8) + 5 and explain briefly.",
+        "Frage den Assistenten",
+        placeholder="z.B.: Berechne (12 * 8) + 5 und erkläre kurz.",
         height=100,
     )
-    submitted = st.form_submit_button("Run agent")
+    submitted = st.form_submit_button("Agent starten")
 
 if submitted:
     prompt = user_prompt.strip()
     if not prompt:
-        st.warning("Please enter a prompt.")
+        st.warning("Bitte gib eine Anfrage ein.")
     else:
-        with st.spinner("Running agent..."):
+        with st.spinner("Agent läuft..."):
             try:
                 result = run_agent(prompt)
                 st.session_state.history.append(
@@ -595,14 +657,14 @@ if submitted:
                     }
                 )
             except Exception as exc:  # noqa: BLE001
-                st.error(f"Agent failed: {exc}")
+                st.error(f"Agent fehlgeschlagen: {exc}")
 
 if st.session_state.history:
-    st.subheader("Recent Runs")
+    st.subheader("Letzte Ausführungen")
     for idx, item in enumerate(reversed(st.session_state.history), start=1):
-        st.markdown(f"### Run {idx}")
-        st.markdown(f"**Prompt**: {item['prompt']}")
-        with st.expander("Planner output"):
+        st.markdown(f"### Durchlauf {idx}")
+        st.markdown(f"**Anfrage**: {item['prompt']}")
+        with st.expander("Planerausgabe"):
             st.write(item["plan"])
-        st.markdown("**Response**")
+        st.markdown("**Antwort**")
         st.write(item["response"])
