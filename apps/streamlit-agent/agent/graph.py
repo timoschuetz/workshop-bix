@@ -129,6 +129,22 @@ def batch_analysis_node(state: AgentState) -> AgentUpdate:
     return {"batch_analysis": analysis}
 
 
+_VARIABLE_NAMES: dict[str, str] = {
+    "temp_C": "Temperatur",
+    "pH": "pH-Wert",
+    "feed_A_Lph": "Zulauf A",
+    "feed_B_Lph": "Zulauf B",
+    "agitator_rpm": "Rührerdrehzahl",
+    "pressure_bar": "Druck",
+    "dissolved_O2": "Gelöster Sauerstoff",
+    "conductivity": "Leitfähigkeit",
+    "turbidity": "Trübung",
+    "level_L": "Füllstand",
+    "flow_rate": "Durchfluss",
+    "viscosity": "Viskosität",
+}
+
+
 def _severity(mean_abs_z: float) -> tuple[str, str]:
     if mean_abs_z >= 2.5:
         return "hoch", "🔴"
@@ -149,12 +165,14 @@ def report_node(state: AgentState) -> AgentUpdate:
         if not d.get("variable") or d.get("mean_abs_z") is None:
             continue
         label, ampel = _severity(float(d["mean_abs_z"]))
-        table_rows.append(f"| {d['variable']} | {ampel} {label} |")
+        var = d["variable"]
+        name = _VARIABLE_NAMES.get(var, var)
+        table_rows.append(f"| {name} | {var} | {ampel} {label} |")
 
     if table_rows:
         driver_table = (
-            "| Messwert | Abweichung |\n"
-            "|---|---|\n"
+            "| Name | Messwert | Abweichung |\n"
+            "|---|---|---|\n"
             + "\n".join(table_rows)
         )
     else:
@@ -171,17 +189,23 @@ def report_node(state: AgentState) -> AgentUpdate:
         "5. Schreibe in kurzen, klaren Sätzen – so wie du es einem Kollegen auf dem Hallenflur erklären würdest.\n"
         "6. Die auffälligen Messwerte sind bereits als Tabelle mit Ampel vorgegeben. "
         "Übernimm diese Tabelle exakt so in den Bericht – ergänze sie nicht und verändere sie nicht.\n"
-        "7. Handlungsempfehlungen müssen konkrete Anweisungen sein, was der Maschinenführer beim nächsten Batch tun soll."
+        "7. Verwende für die drei Abschnitte die folgenden Markdown-Überschriften exakt so: "
+        "'### Was ist passiert?', '### Auffällige Messwerte', '### Was ist zu tun?'. "
+        "Keine nummerierten Listen.\n"
+        "8. Handlungsempfehlungen müssen konkrete Anweisungen sein, was der Maschinenführer beim nächsten Batch tun soll."
     )
 
     user_prompt = (
         f"Erstelle einen Produktionsbericht für Batch {batch_id}.\n\n"
         f"Kritischste Phase: {critical_phase}\n\n"
         f"Auffällige Messwerte (bereits als Tabelle – exakt so übernehmen):\n\n{driver_table}\n\n"
-        "Strukturiere den Bericht so:\n"
-        "1. Was ist passiert? (kurze Zusammenfassung in 1-2 Sätzen)\n"
-        "2. Füge hier die Tabelle der auffälligen Messwerte ein.\n"
-        "3. Was soll der Maschinenführer beim nächsten Batch konkret anders machen? (eine klare Anweisung pro Messwert)"
+        "Strukturiere den Bericht mit diesen drei Abschnitten:\n\n"
+        "### Was ist passiert?\n"
+        "(Kurze Zusammenfassung in 1-2 Sätzen. Nenne die kritische Phase namentlich.)\n\n"
+        "### Auffällige Messwerte\n"
+        "(Tabelle hier exakt einfügen.)\n\n"
+        "### Was ist zu tun?\n"
+        "(Eine konkrete Anweisung pro auffälligem Messwert für den nächsten Batch.)"
     )
 
     try:
