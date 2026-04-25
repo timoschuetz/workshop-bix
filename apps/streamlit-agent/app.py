@@ -215,7 +215,13 @@ def _deviation_chart(batch_id: str) -> go.Figure | None:
 
 _MIN_EVAL_PTS = 10  # data points needed before warnings are meaningful
 
-def _render_warning_box(last, n_pts: int = 0) -> None:
+def _render_warning_box(
+    critical: bool,
+    early_warning: bool,
+    flagged_vars: list[str],
+    z_scores: dict[str, float],
+    n_pts: int = 0,
+) -> None:
     if n_pts < _MIN_EVAL_PTS:
         st.markdown(
             '<div class="gbd-box gbd-box-wait" style="font-size:0.85rem;display:flex;align-items:center;">'
@@ -224,21 +230,24 @@ def _render_warning_box(last, n_pts: int = 0) -> None:
         )
         return
 
-    if last.critical or last.early_warning:
-        flagged = last.flagged_variables_window
-        top_z = sorted(last.z_scores.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:3]
+    if critical or early_warning:
+        flagged = flagged_vars
+        top_z = sorted(
+            [(v, z) for v, z in z_scores.items() if abs(float(z)) > 2.0],
+            key=lambda kv: abs(float(kv[1])), reverse=True,
+        )[:3]
 
         def _sev_label(z: float) -> str:
-            a = abs(z)
             arrow = "↑" if z > 0 else "↓"
-            return f"{arrow} {'sehr hoch' if a >= 4 else 'hoch' if a >= 2.5 else 'mittel'}"
+            level = "sehr hoch" if abs(z) >= 4 else "hoch"
+            return f"Abweichung {arrow} {level}"
 
         flagged_readable = ", ".join(_VAR_NAMES.get(v, v) for v in flagged) if flagged else "–"
         top_z_str = " &nbsp;·&nbsp; ".join(
-            f"<b>{_VAR_NAMES.get(v, v)}</b> {_sev_label(float(z))}" for v, z in top_z
+            f"<b>{_VAR_NAMES.get(v, v)}</b>: {_sev_label(float(z))}" for v, z in top_z
         ) if top_z else "–"
 
-        if last.critical:
+        if critical:
             box_cls, lbl_cls, label = "gbd-box-crit", "gbd-label-crit", "🔴 Kritisch"
             subtitle = "Viele Messwerte außerhalb des Normalbereichs"
         else:
@@ -736,14 +745,40 @@ with tab_mon:
                 )
                 last = evals[-1]
 
-                # ── Auto-var: accumulate flagged variables into history ────────────
+                # ── Golden-profile index (used throughout: auto-vars, chart, table) ─
+                gp_index: dict[tuple[str, int, str], dict] = {}
+                for _r in profile.get("rows") or []:
+                    try:
+                        gp_index[(str(_r["phase"]), int(_r["t_pct_bucket"]), str(_r["variable"]))] = _r
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                def _t_bucket(t: float) -> int:
+                    return int((float(t) // 5) * 5)
+
+                def _band_flags_zscores(p) -> tuple[dict[str, bool], dict[str, float]]:
+                    """Direct band comparison — consistent with displayed Golden Band."""
+                    t_b = _t_bucket(p.t_pct)
+                    flags: dict[str, bool] = {}
+                    z_sc: dict[str, float] = {}
+                    for var, x in p.values.items():
+                        row = gp_index.get((str(p.phase), t_b, var))
+                        if not row or float(row["std"]) <= 0:
+                            continue
+                        z = (float(x) - float(row["mean"])) / float(row["std"])
+                        z_sc[var] = z
+                        flags[var] = abs(z) > 2.0
+                    return flags, z_sc
+
+                # ── Auto-var: use direct band flags (consistent with graph/table) ──
                 if st.session_state.mon_auto_vars and len(pts_n) >= _MIN_EVAL_PTS:
-                    _flagged_now = set(last.flagged_variables_window or [])
+                    _cur_flags, _ = _band_flags_zscores(pts_n[-1])
+                    _flagged_now = {v for v, outside in _cur_flags.items() if outside}
                     _consec = st.session_state.mon_consec_flags
                     for v in variables_all:
                         _consec[v] = (_consec.get(v, 0) + 1) if v in _flagged_now else 0
                     for v, cnt in _consec.items():
-                        if cnt >= 2:
+                        if cnt >= 1:
                             st.session_state.mon_auto_var_history.add(v)
                 if st.session_state.mon_auto_vars:
                     _auto = [v for v in st.session_state.mon_auto_var_history if v in variables_all]
@@ -766,7 +801,8 @@ with tab_mon:
 
                 # ── Metrics ───────────────────────────────────────────────────────
                 mc1, mc2, mc3 = st.columns(3)
-                _flags_content = str(len(last.flagged_variables_window)) if len(pts_n) >= _MIN_EVAL_PTS else "–"
+                _cur_direct_flags, _ = _band_flags_zscores(pts_n[-1])
+                _flags_content = str(sum(1 for v in _cur_direct_flags.values() if v)) if len(pts_n) >= _MIN_EVAL_PTS else "–"
                 with mc1:
                     st.markdown(f'<div class="gbd-metric"><div class="gbd-metric-title">Phase</div>'
                                 f'<div class="gbd-metric-val">{last.phase}</div></div>',
@@ -782,25 +818,31 @@ with tab_mon:
 
                 # ── Build chart ───────────────────────────────────────────────────
                 x = [p.t_pct for p in pts_n]
-                flagged_pts = [any(e.flags.values()) for e in evals]
+                _pt_direct = [_band_flags_zscores(p) for p in pts_n]
+                flagged_pts = [any(f.values()) for f, _ in _pt_direct]
                 colors = ["#E45756" if f else "#4C78A8" for f in flagged_pts]
 
-                def _fmt_point_hover(e, var: str, val: float) -> str:
-                    flagged_vars = sorted([k for k, v in e.flags.items() if v])
-                    top_z = sorted(e.z_scores.items(), key=lambda kv: abs(float(kv[1])), reverse=True)[:4]
+                def _fmt_point_hover(e, var: str, val: float,
+                                     direct_flags: dict[str, bool],
+                                     direct_z: dict[str, float]) -> str:
+                    flagged_vars = sorted([k for k, v in direct_flags.items() if v])
+                    # Only show direction for variables that are actually outside the band
+                    flagged_z = sorted(
+                        [(v, direct_z[v]) for v in flagged_vars if v in direct_z],
+                        key=lambda kv: abs(float(kv[1])), reverse=True,
+                    )
 
                     def _sev(z: float) -> str:
-                        a = abs(z)
                         direction = "↑" if z > 0 else "↓"
-                        return f"{direction} {'stark' if a >= 2.5 else 'mittel' if a >= 1.2 else 'gering'}"
+                        return f"{direction} {'sehr stark' if abs(z) >= 4 else 'stark' if abs(z) >= 2.5 else 'hoch'}"
 
                     lines = [f"<b>Phase: {e.phase} &nbsp;|&nbsp; {e.t_pct:.1f} %</b>", f"{var}: {val:.3f}"]
                     if flagged_vars:
                         lines.append("<br>⚠ <b>Außerhalb Normalbereich:</b>")
-                        lines += [f"&nbsp;&nbsp;• {v}" for v in flagged_vars]
-                    if top_z:
-                        lines.append("<br><b>Stärkste Abweichungen:</b>")
-                        lines += [f"&nbsp;&nbsp;• {v}: {_sev(float(z))}" for v, z in top_z]
+                        lines += [
+                            f"&nbsp;&nbsp;• {_VAR_NAMES.get(v, v)}: {_sev(float(z))}"
+                            for v, z in flagged_z
+                        ]
                     return "<br>".join(lines)
 
                 fig = go.Figure()
@@ -820,29 +862,24 @@ with tab_mon:
                         name=f"Phase: {ph}", showlegend=True, hoverinfo="skip",
                     ))
 
-                gp_index: dict[tuple[str, int, str], dict] = {}
-                for r in profile.get("rows") or []:
-                    try:
-                        gp_index[(str(r["phase"]), int(r["t_pct_bucket"]), str(r["variable"]))] = r
-                    except Exception:  # noqa: BLE001
-                        continue
-
-                def _t_bucket(t: float) -> int:
-                    return int((float(t) // 5) * 5)
-
                 _Y2_VARS = {"agitator_rpm"}  # variables shown on the right axis
                 _var_color_map = {v: _PALETTE[i % len(_PALETTE)] for i, v in enumerate(variables_all)}
 
                 for var in selected_vars:
                     y = [float(p.values.get(var, float("nan"))) for p in pts_n]
-                    hover_texts = [_fmt_point_hover(e, var, v) for e, v in zip(evals, y)]
+                    hover_texts = [
+                        _fmt_point_hover(evals[i], var, v, _pt_direct[i][0], _pt_direct[i][1])
+                        for i, v in enumerate(y)
+                    ]
                     _yax = "y2" if var in _Y2_VARS else "y"
+                    # Per-variable flagging: dot is red only when THIS variable is outside its band
+                    _var_outside = [_pt_direct[i][0].get(var, False) for i in range(len(pts_n))]
                     if st.session_state.mon_distinct_colors:
                         _line_c = _var_color_map.get(var, "#4C78A8")
                         _marker_colors = _line_c
                     else:
                         _line_c = "rgba(50,50,50,0.45)"
-                        _marker_colors = colors
+                        _marker_colors = ["#E45756" if f else "#4C78A8" for f in _var_outside]
                     fig.add_trace(go.Scatter(
                         x=x, y=y, mode="lines+markers",
                         marker=dict(color=_marker_colors, size=7),
@@ -851,10 +888,10 @@ with tab_mon:
                         hovertemplate="%{text}<extra></extra>",
                         yaxis=_yax,
                     ))
-                    # Flagged-point overlay when using distinct colors
+                    # Flagged-point overlay (×) when using distinct colors
                     if st.session_state.mon_distinct_colors:
-                        _fx = [x[i] for i, f in enumerate(flagged_pts) if f]
-                        _fy = [y[i] for i, f in enumerate(flagged_pts) if f]
+                        _fx = [x[i] for i, f in enumerate(_var_outside) if f]
+                        _fy = [y[i] for i, f in enumerate(_var_outside) if f]
                         if _fx:
                             fig.add_trace(go.Scatter(
                                 x=_fx, y=_fy, mode="markers",
@@ -927,7 +964,22 @@ with tab_mon:
                     st.plotly_chart(fig, use_container_width=True)
 
                 with col_panel:
-                    _render_warning_box(last, n_pts=len(pts_n))
+                    # Use current-point flags only — consistent with the table
+                    _cur_flags_warn, _cur_z = _pt_direct[-1]
+                    _cur_flagged_vars = sorted(v for v, out in _cur_flags_warn.items() if out)
+                    _direct_ew = len(_cur_flagged_vars) >= 1
+                    # Critical: proportion of current-phase points with any flag > 0.6
+                    _cur_phase = pts_n[-1].phase
+                    _phase_direct = [(p, _pt_direct[i]) for i, p in enumerate(pts_n) if p.phase == _cur_phase]
+                    _phase_flagged = sum(1 for _, (_df, _) in _phase_direct if any(_df.values()))
+                    _direct_critical = (_phase_flagged / len(_phase_direct)) > 0.6 if _phase_direct else False
+                    _render_warning_box(
+                        critical=_direct_critical,
+                        early_warning=_direct_ew,
+                        flagged_vars=_cur_flagged_vars,
+                        z_scores=_cur_z,
+                        n_pts=len(pts_n),
+                    )
                     st.markdown("---")
                     st.markdown(
                         '<div class="gbd-ai-header">'
@@ -960,19 +1012,30 @@ with tab_mon:
                     cur_val = last_pt.values.get(var)
                     if cur_val is None:
                         continue
-                    z = last.z_scores.get(var)
-                    flagged_var = last.flags.get(var, False)
                     t_b = _t_bucket(last_pt.t_pct)
                     gp_row = gp_index.get((str(last_pt.phase), t_b, var))
                     golden_med: float | str = round(float(gp_row["mean"]), 3) if gp_row else "–"
                     golden_band: str = (
                         f"{float(gp_row['lower']):.3f} – {float(gp_row['upper']):.3f}" if gp_row else "–"
                     )
-                    abs_z = abs(z) if z is not None else -1.0
-                    status_icon = "🔴" if abs_z >= 2.5 else "🟡" if abs_z >= 1.2 else ("🟢" if z is not None else "⚪")
-                    abw_label = "hoch" if abs_z >= 2.5 else "mittel" if abs_z >= 1.2 else ("gering" if z is not None else "–")
+                    # Recompute z directly from the displayed band so status is always consistent
+                    if gp_row and float(gp_row["std"]) > 0:
+                        z_table = (float(cur_val) - float(gp_row["mean"])) / float(gp_row["std"])
+                        abs_z = abs(z_table)
+                    else:
+                        z_table = None
+                        abs_z = -1.0
+                    outside = abs_z > 2.0
+                    if outside:
+                        status_icon, abw_label = "🔴", "hoch"
+                    elif abs_z >= 1.6:
+                        status_icon, abw_label = "🟡", "mittel"
+                    elif z_table is not None:
+                        status_icon, abw_label = "🟢", "–"
+                    else:
+                        status_icon, abw_label = "⚪", "–"
                     detail_rows.append({
-                        "_abs_z": abs_z, "_flagged": flagged_var,
+                        "_abs_z": abs_z, "_flagged": outside,
                         "": status_icon,
                         "Messwert": _VAR_NAMES.get(var, var),
                         "Kennung": var, "Einheit": unit,
